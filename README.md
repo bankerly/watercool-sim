@@ -1,5 +1,7 @@
 # 虚拟水冷坞 · WaterCoolSim
 
+![build](https://github.com/bankerly/watercool-sim/actions/workflows/build.yml/badge.svg)
+
 > 让 **机械革命控制中心（ControlCenterX）** 认为「水冷已连接」的本地模拟器。
 > 单文件 exe、零第三方依赖、界面用 Material 3（Monet 动态取色）自绘。
 
