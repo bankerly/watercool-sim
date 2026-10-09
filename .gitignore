@@ -1,0 +1,21 @@
+# 构建产物
+dist/
+*.exe
+*.dll
+*.pdb
+
+# 运行期产物
+*.log
+trayprobe.log
+
+# 开发/IDE
+.vs/
+*.user
+*.suo
+__pycache__/
+*.pyc
+
+# 临时
+o.txt
+e.txt
+*.tmp
