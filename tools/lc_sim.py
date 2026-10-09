@@ -188,7 +188,7 @@ def main(argv=None):
     ap.add_argument("--client-id", default=None, help="手动指定 clientId（用于非官方 broker）")
     ap.add_argument("--user", default=None, help="手动指定用户名（配合 --client-id）")
     ap.add_argument("--password", default=None, help="手动指定密码（配合 --client-id）")
-    ap.add_argument("--mac", default="5C:8A:3B:00:1A:2F", help="伪装的水冷坞蓝牙 MAC")
+    ap.add_argument("--mac", default="AA:BB:CC:00:11:22", help="伪装的水冷坞蓝牙 MAC")
     ap.add_argument("--fw", default="CoolingSystem LCT21001-SIM-v1.0.0", help="固件版本字符串(>=22 字符)")
     ap.add_argument("--interval", type=float, default=1.0, help="定时重发状态的间隔(秒)")
     ap.add_argument("--reconnect-delay", type=float, default=3.0,
