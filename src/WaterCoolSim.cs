@@ -1438,6 +1438,12 @@ public class SimCore
 
             rep.Total++;
             bool tcp = false;
+            if (port <= 0)
+            {
+                pass++;
+                log("[..] broker 端口未知（自动检测没找到端口，可能控制中心没运行）——如果用的是 OpenRevo，本条可忽略");
+                goto afterBroker;
+            }
             try
             {
                 using (Socket s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
@@ -1455,9 +1461,42 @@ public class SimCore
             }
             else
             {
-                log("[!!] broker 端口不可达：" + host + ":" + port);
-                rep.Problems.Add("broker 端口不可达（" + host + ":" + port + "）：控制中心没运行，或端口不同（界面可改「主机/端口」）");
+                bool revoOn = false;
+                try { revoOn = OpenRevoSim.IsRunning(); } catch { }
+                if (revoOn)
+                {
+                    pass++;   // 走 OpenRevo 内存挂钩这条路，broker 不存在是正常的，不算问题
+                    log("[OK] broker 端口不可达：" + host + ":" + port + "——但检测到 OpenRevo 第三方控制台，它不走 broker（本程序用内置内存挂钩模拟），此项不计为问题");
+                }
+                else
+                {
+                    log("[!!] broker 端口不可达：" + host + ":" + port);
+                    rep.Problems.Add("broker 端口不可达（" + host + ":" + port + "）：控制中心没运行，或端口不同（界面可改「主机/端口」）");
+                }
             }
+
+            afterBroker:
+            // ---- 第三方控制台（OpenRevo）：它不用 MQTT broker，靠内存挂钩模拟 ----
+            rep.Total++;
+            try
+            {
+                bool repaired = false;
+                try { repaired = OpenRevoSim.RepairIfStale(); } catch { }
+                if (repaired) log("[OK] OpenRevo：清理了上次残留的挂钩（已还原原始指令）");
+                if (OpenRevoSim.IsRunning())
+                {
+                    pass++;
+                    log("[OK] 第三方控制台 OpenRevo：" + OpenRevoSim.Describe());
+                    if (!OpenRevoSim.Attached)
+                        log("     （「软件设置 → 第三方控制台」里的开关打开后会自动挂钩；挂钩只改它的运行内存，退出本程序即自动还原）");
+                }
+                else
+                {
+                    pass++;
+                    log("[..] 第三方控制台 OpenRevo：未运行（需要时启动它，再打开「软件设置 → 第三方控制台」开关）");
+                }
+            }
+            catch (Exception ex) { log("[..] 第三方控制台检测失败：" + ex.Message); }
 
             rep.Total++;
             pass++;
@@ -2867,9 +2906,13 @@ public class SimCore
         private Md3Button btnStart, btnStop, btnRecheck, btnRefresh;
         private Md3Switch swTray, swAuto, swAutoSim, swCleanStart, swSuppress;
         private Md3Field fHost, fPort, fSlot, fMac, fFw, fInterval;
-        private Md3Card cardSet, cardLog;
+        private Md3Card cardSet, cardLog, cardRevo;
         private Label lblCardSet, lblLog, lblStats, lblHint;
         private Label lblSw1, lblSw2, lblSw3, lblSw4, lblSw5;
+        private Md3Switch swRevo;
+        private Md3Button btnRevoRetry;
+        private Label lblRevo, lblRevoSub;
+        private System.Windows.Forms.Timer revoTimer;
         private TextBox txtLog, txtInfo, txtAbout;
         private System.Windows.Forms.Timer timer;
         private NotifyIcon tray;
@@ -3013,6 +3056,38 @@ public class SimCore
             swAutoSim.CheckedChanged += delegate { Settings.SetBool("AutoSim", swAutoSim.Checked); Log("[设置] 自启动时同时开始模拟：" + (swAutoSim.Checked ? "开" : "关")); };
             swCleanStart.CheckedChanged += delegate { Settings.SetBool("CleanStart", swCleanStart.Checked); Log("[设置] 启动时清理上次残留：" + (swCleanStart.Checked ? "开" : "关")); };
             swSuppress.CheckedChanged += delegate { Settings.SetBool("Suppress", swSuppress.Checked); Log("[设置] 压制真实上报：" + (swSuppress.Checked ? "开" : "关")); };
+
+            // ---- 第三方控制台（OpenRevo）模拟卡片 ----
+            cardRevo = new Md3Card();
+            cardRevo.P = P;
+            pageSet.Controls.Add(cardRevo);
+            lblRevo = MkLabel("第三方控制台（OpenRevo）", 11F, FontStyle.Bold, P.OnSurface, true);
+            cardRevo.Controls.Add(lblRevo);
+            swRevo = MkSwitch(Settings.GetBool("RevoSim", true), cardRevo);
+            lblRevoSub = MkLabel("模拟「水冷外置魔盒已连接」（只改它的运行内存，不动文件；退出即还原）", 9F, FontStyle.Regular, P.OnSurfaceVariant, true);
+            cardRevo.Controls.Add(lblRevoSub);
+            btnRevoRetry = MkButton("重新挂钩", Md3Kind.Outlined, 9F, FontStyle.Regular);
+            btnRevoRetry.Click += delegate { TryRevoAttach(); };
+            cardRevo.Controls.Add(btnRevoRetry);
+            swRevo.CheckedChanged += delegate
+            {
+                Settings.SetBool("RevoSim", swRevo.Checked);
+                Log("[OpenRevo] 模拟已连接：" + (swRevo.Checked ? "开" : "关"));
+                if (swRevo.Checked) TryRevoAttach();
+                else { OpenRevoSim.Detach(); RefreshRevoLabel(); }
+            };
+            revoTimer = new System.Windows.Forms.Timer();
+            revoTimer.Interval = 2000;
+            revoTimer.Tick += delegate { RevoTick(); };
+            revoTimer.Start();
+            RefreshRevoLabel();
+            // 上次若是被强杀，内存里的挂钩会残留在 OpenRevo 里：启动时先还原
+            try
+            {
+                if (OpenRevoSim.RepairIfStale())
+                    Log("[OpenRevo] 检测到上次残留的挂钩，已用磁盘原始字节还原");
+            }
+            catch { }
 
             // ---- 页面 4：关于 ----
             pageAbout = MkPage();
@@ -3625,6 +3700,12 @@ public class SimCore
             swSuppress.SetBounds(left, rowY + dy * 2, 52, 32);
             lblSw5.SetBounds(left + 62, rowY + dy * 2 + 4, Math.Min(wA + 120, right - (left + 62)), 24);
 
+            cardRevo.SetBounds(0, cardSet.Bottom + 12, cw, 152);
+            lblRevo.SetBounds(20, 14, Math.Max(240, cardRevo.Width - 40), 26);
+            swRevo.SetBounds(20, 54, 52, 32);
+            lblRevoSub.SetBounds(82, 58, Math.Max(160, cardRevo.Width - 82 - 150), 24);
+            btnRevoRetry.SetBounds(cardRevo.Width - 130, 50, 110, 36);
+
             txtAbout.SetBounds(0, 0, cw, ch);
             Invalidate();
         }
@@ -3694,7 +3775,15 @@ public class SimCore
                         Log(probeOk ? "自动测试连接：通过（broker 可达 / 鉴权通过 / 已订阅）" : "自动测试连接：失败（见上面的报错）");
                     }
                     catch (Exception pex) { Log("自动测试异常：" + pex.Message); }
-                    if (!probeOk) rep.Problems.Add("自动测试连接失败：无法接入 broker（控制中心没运行 / 端口不同 / 鉴权编号不通）");
+                    if (!probeOk)
+            {
+                bool revoOn2 = false;
+                try { revoOn2 = OpenRevoSim.IsRunning(); } catch { }
+                if (revoOn2)
+                    Log("（检测到 OpenRevo 第三方控制台：它不使用 MQTT broker，本程序已内置内存挂钩模拟，此项不计为问题）");
+                else
+                    rep.Problems.Add("自动测试连接失败：无法接入 broker（控制中心没运行 / 端口不同 / 鉴权编号不通）");
+            }
                     if (rep.Problems.Count == 0 || Program.NoStartupCleanup) return;
                     BeginInvoke(new Action(delegate
                     {
@@ -3842,16 +3931,48 @@ public class SimCore
             Close();
         }
 
+        // ---------------- OpenRevo 模拟 ----------------
+        private void RevoTick()
+        {
+            if (swRevo == null) return;
+            if (swRevo.Checked && !OpenRevoSim.Attached) TryRevoAttach();
+            else RefreshRevoLabel();
+        }
+
+        private void TryRevoAttach()
+        {
+            if (OpenRevoSim.Attached) { RefreshRevoLabel(); return; }
+            bool ok = OpenRevoSim.Attach();
+            Log("[OpenRevo] " + (ok ? "挂钩成功：它现在会显示「水冷已连接」" : "挂钩失败：" + OpenRevoSim.LastError));
+            RefreshRevoLabel();
+        }
+
+        private void RefreshRevoLabel()
+        {
+            if (lblRevo == null) return;
+            string s = "第三方控制台（OpenRevo）" + (OpenRevoSim.Attached ? "  ● 已模拟已连接" : "");
+            if (lblRevo.InvokeRequired) { lblRevo.BeginInvoke(new Action(delegate { RefreshRevoLabel(); })); return; }
+            lblRevo.Text = s;
+        }
+
+        private void StopRevoSim()
+        {
+            try { if (revoTimer != null) revoTimer.Stop(); } catch { }
+            try { OpenRevoSim.Detach(); } catch { }
+        }
+
         private void OnClosing(object sender, FormClosingEventArgs e)
         {
             if (exiting)
             {
+                StopRevoSim();
                 timer.Stop();
                 if (core != null && started) { core.Stop(true); started = false; }
                 return;
             }
             if (e.CloseReason == CloseReason.WindowsShutDown || e.CloseReason == CloseReason.TaskManagerClosing)
             {
+                StopRevoSim();
                 timer.Stop();
                 if (core != null && started) { core.Stop(true); started = false; }
                 return;

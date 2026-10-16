@@ -2,19 +2,23 @@
 
 ![build](https://github.com/bankerly/watercool-sim/actions/workflows/build.yml/badge.svg)
 
-> 让 **机械革命控制中心（ControlCenterX）** 认为「水冷已连接」的本地模拟器。
+> 让 **机械革命控制中心（ControlCenterX）** 与 **第三方控制台 OpenRevo** 认为「水冷已连接」的本地模拟器。
 > 单文件 exe、零第三方依赖、界面用 Material 3（Monet 动态取色）自绘。
 
 ![主界面](docs/screenshots/ui.page0.png)
 
 ## 它做什么
 
-在同一台机器上运行的本程序，通过本机 MQTT broker（`127.0.0.1:13688`，由控制中心的 `GCUBridge.exe` 提供）发布/保持水冷状态报文，
-让控制中心界面显示「水冷已连接」。可用于：没有接水冷坞时演示界面、排查控制中心的水冷相关逻辑、做界面联调。
+本程序支持两种控制台（自动识别，可同时生效）：
+
+1. **官方控制中心（ControlCenterX）**：通过本机 MQTT broker（`127.0.0.1:13688`，由 `GCUBridge.exe` 提供）发布/保持水冷状态报文；
+2. **第三方控制台 OpenRevo**：它**不使用 broker**（自己用 WinRT BLE 直连水冷坞），因此改用**进程内内存挂钩**——在它序列化水冷状态之前，把状态结构里的 `connected` 等字段改成「已连接」（详见 [docs/适配OpenRevo.md](docs/适配OpenRevo.md)）。
+
+可用于：没有接水冷坞时演示界面、排查控制台的水冷相关逻辑、做界面联调。
 
 **它不做什么**：
 
-- 不写驱动、不注入进程、不改控制中心的任何文件或安装目录；
+- 不写驱动、不改任何控制台的磁盘文件或安装目录（OpenRevo 那条路也只改它的**运行内存**，开关关闭/程序退出即还原原始指令）；
 - 不伪造硬件；只与本地 broker 收发 MQTT 报文；
 - 停止/关闭时自动把状态**覆盖回「未连接」**，并只清理自己发过的 retained 消息（带 `"src":"lc_sim"` 标记的记录）。
 
