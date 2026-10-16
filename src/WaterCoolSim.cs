@@ -544,12 +544,74 @@ namespace WaterCoolSim
             catch (Exception ex) { if (log != null) log("[配置] 写示例配置失败：" + ex.Message); }
         }
 
+        // 只做一遍全扫描，之后每份配置复用「像 MQTT 的端口」集合
+        private static Profile AutoPickCore(string host, int slot, Action<string> log, out int foundPort)
+        {
+            foundPort = 0;
+            List<Profile> list = LoadAll();
+            PortDetect.LastMqttPorts.Clear();
+            foreach (Profile p in list)
+            {
+                p.Apply();
+                if (PortDetect.TryOnePublic(p.Host, p.Port, p.Slots[0]) == 2)
+                {
+                    foundPort = p.Port;
+                    Settings.Set("LastPort", p.Port);
+                    log("[配置] 已适配：" + p.Name + "  →  " + p.Host + ":" + p.Port);
+                    return p;
+                }
+            }
+            Profile first = list[0];
+            first.Apply();
+            bool ok;
+            int port = PortDetect.Detect(first.Host, first.Port, slot, log, out ok);
+            if (ok)
+            {
+                foundPort = port;
+                log("[配置] 已适配：" + first.Name + "  →  " + first.Host + ":" + port);
+                return first;
+            }
+            List<int> cand = new List<int>(PortDetect.LastMqttPorts);
+            foreach (Profile p in list)
+            {
+                p.Apply();
+                foreach (int q in cand)
+                {
+                    if (PortDetect.TryOnePublic(p.Host, q, p.Slots[0]) == 2)
+                    {
+                        foundPort = q;
+                        Settings.Set("LastPort", q);
+                        log("[配置] 已适配：" + p.Name + "  →  " + p.Host + ":" + q);
+                        return p;
+                    }
+                }
+            }
+            first.Apply();
+            log("[配置] 没找到可连上的控制台（控制中心/第三方控制台没运行？），先用内置配置：「" + first.Name + "」");
+            return first;
+        }
         // 启动时自动挑一个能连上的配置（第三方控制台也是走这条）
         public static Profile AutoPick(string host, int slot, Action<string> log, out int foundPort)
         {
             foundPort = 0;
+            if (true) { return AutoPickCore(host, slot, log, out foundPort); }
             List<Profile> list = LoadAll();
             Profile best = list[0];
+            // 第一轮：只试每个配置自己写的端口（毫秒级，避免每份配置都全端口扫一遍）
+            foreach (Profile p in list)
+            {
+                p.Apply();
+                int tp = PortDetect.TryOnePublic(p.Host, p.Port, p.Slots[0]);
+                if (tp == 2)
+                {
+                    log("[配置] 已适配：" + p.Name + "  →  " + p.Host + ":" + p.Port
+                        + "  主题 " + p.TopicStatus + " / " + p.TopicHwocStatus);
+                    Settings.Set("LastPort", p.Port);
+                    foundPort = p.Port;
+                    return p;
+                }
+            }
+            // 第二轮：整机扫一遍（只做一次），再用命中的端口回查每份配置
             foreach (Profile p in list)
             {
                 bool ok;
@@ -746,7 +808,41 @@ public class FakeDock
             return res;
         }
 
+        // 极快的 TCP 预筛：回环上被拒的端口毫秒级返回，黑洞端口最多等 tmoMs
+        private static bool TcpOk(string host, int port, int tmoMs)
+        {
+            Socket s = null;
+            try
+            {
+                s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                IAsyncResult ar = s.BeginConnect(host, port, null, null);
+                if (!ar.AsyncWaitHandle.WaitOne(tmoMs)) return false;
+                s.EndConnect(ar);
+                return true;
+            }
+            catch { return false; }
+            finally { if (s != null) { try { s.Close(); } catch { } } }
+        }
+
+        // 像控制台的端口优先：厂商常用段 + MQTT 常见端口
+        private static int Rank(int p)
+        {
+            if (p >= 13000 && p <= 14000) return 0;      // 机械革命 13688 所在段
+            if (p == 1883 || p == 8883 || p == 8083) return 1;
+            if (p >= 1800 && p <= 1900) return 2;
+            if (p >= 5000 && p <= 5100) return 3;
+            if (p >= 7000 && p <= 7100) return 4;
+            if (p >= 8800 && p <= 8900) return 5;
+            if (p >= 10000 && p <= 11000) return 6;
+            if (p < 1024) return 9;                      // 系统端口放最后
+            return 7;
+        }
+
+        public static List<int> LastMqttPorts = new List<int>();   // 识别过程中发现"像 MQTT broker"的端口
+
         // 0=连不上/不是 MQTT   1=是 MQTT broker 但认证被拒   2=连接成功
+        public static int TryOnePublic(string host, int port, int slot) { return TryOne(host, port, slot); }
+
         private static int TryOne(string host, int port, int slot)
         {
             MqttMini m = null;
@@ -754,7 +850,7 @@ public class FakeDock
             {
                 m = new MqttMini(host, port, Profile.Cur.Cred(slot, 0), Profile.Cur.Cred(slot, 1),
                     Profile.Cur.Cred(slot, 2), delegate(string s) { });
-                m.TimeoutMs = 500;
+                m.TimeoutMs = 350;
                 m.Connect();
                 return 2;
             }
@@ -786,7 +882,13 @@ public class FakeDock
                     || nm.Contains("aistone") || nm.Contains("liquid")) vendor.Add(kv.Key);
                 else others.Add(kv.Key);
             }
-            vendor.Sort(); others.Sort();
+            vendor.Sort();
+            others.Sort(new Comparison<int>(delegate(int a, int b)
+            {
+                int ra = Rank(a), rb = Rank(b);
+                if (ra != rb) return ra - rb;
+                return a - b;
+            }));
             ordered.AddRange(vendor);
             ordered.AddRange(others);
             if (fallback > 0) ordered.Add(fallback);
@@ -794,7 +896,7 @@ public class FakeDock
             List<int> cand = new List<int>();
             foreach (int p in ordered) if (p > 0 && p < 65536 && seen.Add(p)) cand.Add(p);
             if (cand.Count > 40) cand = cand.GetRange(0, 40);
-            const int BudgetMs = 12000;                 // 总时间预算：超了就停（后台线程，但别拖太久）
+            const int BudgetMs = 8000;                  // 总时间预算：超了就停（后台线程，但别拖太久）
             DateTime t0 = DateTime.UtcNow;
             log("[端口识别] 本机监听 " + lis.Count + " 个端口；候选 " + cand.Count + " 个"
                 + (vendor.Count > 0 ? "（厂商进程持有 " + vendor.Count + " 个）" : "（没发现厂商进程在监听）"));
@@ -810,6 +912,7 @@ public class FakeDock
                     break;
                 }
                 int p = cand[i];
+                if (!TcpOk(host, p, 120)) continue;          // 端口没开 → 直接跳过（毫秒级）
                 int r = 0;
                 for (int s = 0; s < trySlots.Length && r != 2; s++)
                 {
@@ -817,6 +920,7 @@ public class FakeDock
                     if (rr == 2) { r = 2; slot = trySlots[s]; break; }
                     if (rr == 1) r = 1;
                 }
+                if (r == 1 && !LastMqttPorts.Contains(p)) LastMqttPorts.Add(p);
                 if (r == 2)
                 {
                     string owner = lis.ContainsKey(p) && !string.IsNullOrEmpty(lis[p]) ? "，监听进程 " + lis[p] : "";
@@ -2738,6 +2842,8 @@ public class SimCore
         private bool balloonShown;
         private bool trayOk;
         private int trayTries;
+        private volatile bool detectDone;      // 端口/控制台识别是否已完成
+        private volatile bool startPending;    // 识别期间用户点了「启动模拟」
         private SimCore core;
         private bool started, exiting;
         private int page;
@@ -3513,6 +3619,7 @@ public class SimCore
         {
             string h = fHost.Value.Trim();
             int p = PortOf();
+            detectDone = false;
             ThreadPool.QueueUserWorkItem(delegate(object o)
             {
                 try
@@ -3523,6 +3630,8 @@ public class SimCore
                     if (!int.TryParse(fSlot.Value.Trim(), out sl0)) sl0 = 6;
                     int found;
                     Profile picked = Profile.AutoPick(h, sl0, new Action<string>(delegate(string m) { Log(m); }), out found);
+                    detectDone = true;
+                    if (startPending) { startPending = false; try { BeginInvoke(new Action(delegate { Log("[启动] 端口识别完成，继续开始模拟"); OnStart(this, EventArgs.Empty); })); } catch { } }
                     if (picked != null && found > 0)
                     {
                         p = found;
@@ -3584,6 +3693,14 @@ public class SimCore
         private void OnStart(object sender, EventArgs e)
         {
             if (started) return;
+            if (!detectDone)
+            {
+                // 端口/控制台还在识别：记下来，等识别完自动开始（避免用错端口先失败一次）
+                startPending = true;
+                SetState("正在识别端口…", LedState.Idle);
+                Log("[启动] 正在识别水冷端口/控制台配置，识别完成后会自动开始…");
+                return;
+            }
             core = new SimCore(Log);
             core.Dock.Mac = fMac.Value.Trim();
             core.Dock.Fw = fFw.Value.Trim();
@@ -3606,7 +3723,8 @@ public class SimCore
             if (!core.Start())
             {
                 SetState("连接失败", LedState.Error);
-                Log("启动失败：控制中心没运行，或鉴权编号都不通（可到「本机信息」页看自动检测结果）");
+                Log("启动失败：没找到可用连接——控制中心（GCUBridge）没在运行，或鉴权编号都不通。");
+                Log("       排查：① 控制中心是否开着（或服务 GCUBridge 是否已启动）；② 「本机信息」页看「控制台配置」与自动检测结果；③ 命令行 --profiles / --portscan");
                 btnStart.Enabled = true;
                 return;
             }
@@ -3913,11 +4031,15 @@ public class SimCore
                 Out("控制台配置目录：" + Profile.ProfileDir());
                 Profile.WriteSamplesIfMissing(new Action<string>(Out));
                 List<Profile> list = Profile.LoadAll();
+                int chosenPort;
+                Profile chosen = Profile.AutoPick("127.0.0.1", 6, new Action<string>(Out), out chosenPort);
                 foreach (Profile pf in list)
                 {
                     pf.Apply();
-                    bool ok;
-                    int pPort = PortDetect.Detect(pf.Host, pf.Port, pf.Slots[0], new Action<string>(Out), out ok);
+                    bool ok = false;
+                    int pPort = pf.Port;
+                    if (PortDetect.TryOnePublic(pf.Host, pf.Port, pf.Slots[0]) == 2) { ok = true; pPort = pf.Port; }
+                    else foreach (int q in PortDetect.LastMqttPorts) if (PortDetect.TryOnePublic(pf.Host, q, pf.Slots[0]) == 2) { ok = true; pPort = q; break; }
                     Out((ok ? "[可连] " : "[不可连] ") + pf.Name + "   " + pf.Host + ":" + (ok ? pPort.ToString() : pf.Port.ToString())
                         + "   主题 " + pf.TopicStatus + " / " + pf.TopicHwocStatus
                         + (string.IsNullOrEmpty(pf.PayloadConnected) ? "   报文:内置" : "   报文:自定义模板"));
