@@ -824,6 +824,40 @@ public class FakeDock
             finally { if (s != null) { try { s.Close(); } catch { } } }
         }
 
+        // 高信号关键字（只匹配进程名/可执行文件名，避免误伤系统服务）
+        public static readonly string[] ConsoleHints = new string[]
+        {
+            "gcu", "aistone", "mechrevo", "tongfang", "unwill", "clevo", "xmg", "tuxedo",
+            "armoury", "asus", "legion", "lenovo", "nitro", "acer", "omen", "predator",
+            "alienware", "msi", "razer", "gigabyte", "aorus", "ghelper", "nitrosense",
+            "nbfc", "fanctrl", "mcontrolcenter", "controlcenter", "hotkey", "quickset", "accservice",
+            "liquid", "watercool", "coolant", "thermal", "dtt", "ipfsvc", "xtu",
+        };
+
+        // 显示名里出现这些词也算（只用于服务的中文/英文显示名）
+        private static readonly string[] DisplayHints = new string[]
+        {
+            "control center", "控制中心", "gaming center", "thermal", "dynamic tuning",
+            "cooling", "liquid", "water cool", "fan control",
+        };
+
+        public static bool IsConsoleLike(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            string n = name.ToLowerInvariant();
+            int slash = n.LastIndexOfAny(new char[] { '\\', '/' });
+            string leaf = slash >= 0 ? n.Substring(slash + 1) : n;
+            for (int i = 0; i < ConsoleHints.Length; i++) if (leaf.Contains(ConsoleHints[i])) return true;
+            return false;
+        }
+
+        public static bool IsConsoleLikeDisplay(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return false;
+            string n = text.ToLowerInvariant();
+            for (int i = 0; i < DisplayHints.Length; i++) if (n.Contains(DisplayHints[i])) return true;
+            return false;
+        }
         // 像控制台的端口优先：厂商常用段 + MQTT 常见端口
         private static int Rank(int p)
         {
@@ -842,6 +876,8 @@ public class FakeDock
 
         // 0=连不上/不是 MQTT   1=是 MQTT broker 但认证被拒   2=连接成功
         public static int TryOnePublic(string host, int port, int slot) { return TryOne(host, port, slot); }
+
+        public static bool TcpOkPublic(string host, int port, int tmoMs) { return TcpOk(host, port, tmoMs); }
 
         private static int TryOne(string host, int port, int slot)
         {
@@ -878,8 +914,7 @@ public class FakeDock
             foreach (KeyValuePair<int, string> kv in lis)
             {
                 string nm = (kv.Value ?? "").ToLowerInvariant();
-                if (nm.Contains("gcu") || nm.Contains("controlcenter") || nm.Contains("ccu")
-                    || nm.Contains("aistone") || nm.Contains("liquid")) vendor.Add(kv.Key);
+                if (IsConsoleLike(nm)) vendor.Add(kv.Key);
                 else others.Add(kv.Key);
             }
             vendor.Sort();
@@ -3845,6 +3880,89 @@ public class SimCore
     }
 
     // ============================================================
+    //  控制台发现（--discover）：不预设品牌，把所有可疑目标列出来
+    // ============================================================
+    public static class Discover
+    {
+        public static void Run(Action<string> log)
+        {
+            log("=== 控制台发现 ===");
+            log("");
+            log("── 1) 正在运行的进程（名字像控制台 / 持有监听端口）──");
+            Dictionary<int, string> lis = PortDetect.Listeners();
+            HashSet<int> listenPids = new HashSet<int>();
+            try
+            {
+                int size = 0;
+                // 复用 PortDetect 的枚举结果拿不到 PID，这里直接按端口反查
+                foreach (KeyValuePair<int, string> kv in lis)
+                {
+                    try
+                    {
+                        foreach (System.Diagnostics.Process p in System.Diagnostics.Process.GetProcesses())
+                        {
+                            if (p.ProcessName.ToLowerInvariant() == kv.Value.ToLowerInvariant()) { listenPids.Add(p.Id); break; }
+                        }
+                    }
+                    catch { }
+                    break;   // 上面的循环只为填一个示例，真实反查见下面 ports 段
+                }
+            }
+            catch { }
+            foreach (System.Diagnostics.Process p in System.Diagnostics.Process.GetProcesses())
+            {
+                bool like = PortDetect.IsConsoleLike(p.ProcessName);
+                if (!like) continue;
+                string path = "";
+                try { path = p.MainModule.FileName; } catch { }
+                log("  " + p.ProcessName + "  PID " + p.Id + "  " + path);
+            }
+            log("");
+            log("── 2) 服务（名字/路径像控制台）──");
+            try
+            {
+                using (System.Management.ManagementObjectSearcher s = new System.Management.ManagementObjectSearcher("SELECT Name,DisplayName,State,StartMode,PathName FROM Win32_Service"))
+                {
+                    foreach (System.Management.ManagementBaseObject o in s.Get())
+                    {
+                        string nm = Convert.ToString(o["Name"]);
+                        string dn = Convert.ToString(o["DisplayName"]);
+                        string pth = Convert.ToString(o["PathName"]);
+                        if (PortDetect.IsConsoleLike(nm) || PortDetect.IsConsoleLike(pth) || PortDetect.IsConsoleLikeDisplay(dn))
+                            log("  " + nm + "  [" + Convert.ToString(o["State"]) + "/" + Convert.ToString(o["StartMode"]) + "]  " + dn + "  " + pth);
+                    }
+                }
+            }
+            catch (Exception ex) { log("  读服务失败：" + ex.Message); }
+            log("");
+            log("── 3) 本地监听端口 + 是不是 MQTT broker ──");
+            List<int> ks = new List<int>(lis.Keys);
+            ks.Sort();
+            int mqttFound = 0;
+            foreach (int p in ks)
+            {
+                string owner = string.IsNullOrEmpty(lis[p]) ? "(未知进程)" : lis[p];
+                if (!PortDetect.TcpOkPublic("127.0.0.1", p, 120)) { log("  " + p + "  " + owner + "   (连不上)"); continue; }
+                int r = PortDetect.TryOnePublic("127.0.0.1", p, 6);
+                string tag = r == 2 ? "★ MQTT 且认证通过" : (r == 1 ? "◆ MQTT broker（认证被拒）" : "· 不是 MQTT");
+                if (r > 0) mqttFound++;
+                log("  " + p + "  " + owner + "   " + tag);
+            }
+            log("  共发现 " + mqttFound + " 个像 MQTT broker 的端口");
+            log("");
+            log("── 4) 配置（profiles\\*.ini）──");
+            Profile.WriteSamplesIfMissing(null);
+            foreach (Profile pf in Profile.LoadAll())
+            {
+                pf.Apply();
+                log("  " + pf.Name + "   broker " + pf.Host + ":" + pf.Port + "   主题 " + pf.TopicStatus
+                    + (string.IsNullOrEmpty(pf.PayloadConnected) ? "   报文:内置" : "   报文:自定义"));
+            }
+            log("");
+            log("提示：把上面第 3 段里标 ★/◆ 的端口、以及第 1/2 段里你认识的控制台，告诉我（或截图）就能给它配一份 profile。");
+        }
+    }
+    // ============================================================
     //  程序入口（无参数 = GUI；带参数 = 命令行模式）
     // ============================================================
     public static class Program
@@ -4024,6 +4142,12 @@ public class SimCore
             {
                 double secs; if (!double.TryParse(Arg(args, "--seconds", "5"), NumberStyles.Float, CultureInfo.InvariantCulture, out secs)) secs = 5;
                 return core.Probe(secs) ? 0 : 2;
+            }
+
+            if (mode == "--discover")
+            {
+                Discover.Run(new Action<string>(Out));
+                return 0;
             }
 
             if (mode == "--profiles")
@@ -4287,6 +4411,7 @@ public class SimCore
             Out("  WaterCoolSim.exe --runset on|off|status                           设置/查看开机自启动（HKCU Run）");
             Out("  WaterCoolSim.exe --portscan                                       自动识别水冷 broker 端口（诊断用）");
             Out("  WaterCoolSim.exe --profiles                                      列出/测试控制台配置（含第三方适配）");
+            Out("  WaterCoolSim.exe --discover                                      发现本机所有像控制台的进程/服务/MQTT 端口（排查用）");
             Out("  WaterCoolSim.exe --shot [--out p.png]  把界面渲染成 PNG（不碰运行状态）");
             Out("可选参数：--host --port --slot --interval --mac --fw --no-suppress --no-cleanup");
             return 1;
