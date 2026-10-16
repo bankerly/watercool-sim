@@ -35,10 +35,10 @@ namespace WaterCoolSim
 
     public class MqttMini
     {
-        public const string TOPIC_CTRL = "BT_LC/Control";
-        public const string TOPIC_STATUS = "BT_LC/Status";
-        public const string TOPIC_HWOC_CTRL = "LCHWOC/Control";
-        public const string TOPIC_HWOC_STATUS = "LCHWOC/Status";
+        public static string TOPIC_CTRL = "BT_LC/Control";
+        public static string TOPIC_STATUS = "BT_LC/Status";
+        public static string TOPIC_HWOC_CTRL = "LCHWOC/Control";
+        public static string TOPIC_HWOC_STATUS = "LCHWOC/Status";
 
         private string host;
         private int port;
@@ -354,7 +354,223 @@ namespace WaterCoolSim
     // ============================================================
     //  虚拟水冷坞状态机
     // ============================================================
-    public class FakeDock
+        // ============================================================
+    //  控制台配置（profile）：可适配第三方控制台，无需重新编译
+    //  profiles\*.ini 每个文件一个配置；留空/缺省 = 机械革命原厂行为
+    // ============================================================
+    public class Profile
+    {
+        public string Name = "机械革命 ControlCenterX (GCUBridge)";
+        public string SourcePath = "";
+        public string Host = "127.0.0.1";
+        public int Port = 13688;
+        public bool AutoPort = true;
+        public int[] Slots = new int[] { 6, 7, 8, 9, 10, 5, 1, 2, 3, 4 };
+        public string ClientFmt = "UWPClient_{slot}";
+        public string UserFmt = "UWPClient_User_{slot}";
+        public string PassFmt = "UWPClient_Pwd888881772688_{slot}";
+        public string TopicStatus = "BT_LC/Status";
+        public string TopicControl = "BT_LC/Control";
+        public string TopicHwocStatus = "LCHWOC/Status";
+        public string TopicHwocControl = "LCHWOC/Control";
+        public string TopicDevSwitches = "Settings/DeviceSwitchItemStatus";
+        public string ProbeKey = "connected";
+        public string PayloadConnected = "";      // 空 = 用内置的机械革命报文
+        public string PayloadDisconnected = "";
+        public string PayloadHwocOn = "";
+        public string PayloadHwocOff = "";
+
+        public static Profile Cur = new Profile();
+
+        public string Cred(int slot, int kind)
+        {
+            string fmt = kind == 0 ? ClientFmt : (kind == 1 ? UserFmt : PassFmt);
+            return fmt.Replace("{slot}", slot.ToString(CultureInfo.InvariantCulture));
+        }
+
+        // 报文模板里可用 {mac} {fw} {src}
+        public string Subst(string tpl)
+        {
+            return tpl.Replace("{mac}", Program.CurMac)
+                       .Replace("{fw}", Program.CurFw)
+                       .Replace("{src}", FakeDock.TAG);
+        }
+
+        public void Apply()
+        {
+            MqttMini.TOPIC_STATUS = TopicStatus;
+            MqttMini.TOPIC_CTRL = TopicControl;
+            MqttMini.TOPIC_HWOC_STATUS = TopicHwocStatus;
+            MqttMini.TOPIC_HWOC_CTRL = TopicHwocControl;
+            SimCore.TOPIC_DEVSWS = TopicDevSwitches;
+            Cur = this;
+        }
+
+        // ---------- INI 读写 ----------
+        public static Profile FromIni(string path)
+        {
+            Profile p = new Profile();
+            p.SourcePath = path;
+            try
+            {
+                foreach (string raw in File.ReadAllLines(path, Encoding.UTF8))
+                {
+                    string line = raw.Trim();
+                    if (line.Length == 0 || line.StartsWith("#") || line.StartsWith(";") || line.StartsWith("[")) continue;
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+                    string k = line.Substring(0, eq).Trim().ToLowerInvariant();
+                    string v = line.Substring(eq + 1).Trim();
+                    switch (k)
+                    {
+                        case "name": p.Name = v; break;
+                        case "host": p.Host = v; break;
+                        case "port": int pi; if (int.TryParse(v, out pi)) p.Port = pi; break;
+                        case "autoport": p.AutoPort = v == "1" || v.ToLowerInvariant() == "true"; break;
+                        case "slots":
+                            {
+                                List<int> sl = new List<int>();
+                                foreach (string s in v.Split(',')) { int x; if (int.TryParse(s.Trim(), out x) && x > 0) sl.Add(x); }
+                                if (sl.Count > 0) p.Slots = sl.ToArray();
+                                break;
+                            }
+                        case "clientid": p.ClientFmt = v; break;
+                        case "username": p.UserFmt = v; break;
+                        case "password": p.PassFmt = v; break;
+                        case "topic.status": p.TopicStatus = v; break;
+                        case "topic.control": p.TopicControl = v; break;
+                        case "topic.hwoc.status": p.TopicHwocStatus = v; break;
+                        case "topic.hwoc.control": p.TopicHwocControl = v; break;
+                        case "topic.devswitches": p.TopicDevSwitches = v; break;
+                        case "probe.key": p.ProbeKey = v; break;
+                        case "payload.connected": p.PayloadConnected = v; break;
+                        case "payload.disconnected": p.PayloadDisconnected = v; break;
+                        case "payload.hwoc.on": p.PayloadHwocOn = v; break;
+                        case "payload.hwoc.off": p.PayloadHwocOff = v; break;
+                    }
+                }
+            }
+            catch { }
+            return p;
+        }
+
+        public static List<Profile> LoadAll()
+        {
+            List<Profile> list = new List<Profile>();
+            try
+            {
+                string dir = ProfileDir();
+                if (Directory.Exists(dir))
+                {
+                    string[] files = Directory.GetFiles(dir, "*.ini");
+                    Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+                    foreach (string fp in files) list.Add(FromIni(fp));
+                }
+            }
+            catch { }
+            if (list.Count == 0) list.Add(new Profile());     // 没配置就用内置的原厂行为
+            return list;
+        }
+
+        public static string ProfileDir()
+        {
+            return Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "profiles");
+        }
+
+        // 首次运行写出内置示例配置（含第三方控制台模板）
+        public static void WriteSamplesIfMissing(Action<string> log)
+        {
+            try
+            {
+                string dir = ProfileDir();
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                string mech = Path.Combine(dir, "01-mechrevo.ini");
+                if (!File.Exists(mech))
+                    File.WriteAllText(mech, string.Join("\r\n", new string[]
+                    {
+                        "# 机械革命/同方 ControlCenterX（原厂，默认配置）",
+                        "# 其它控制台：复制本文件改成自己的 broker/主题/报文即可（改完不用重新编译）",
+                        "name=机械革命 ControlCenterX (GCUBridge)",
+                        "host=127.0.0.1",
+                        "port=13688",
+                        "autoport=1               # 1=启动时自动搜索端口（推荐）",
+                        "slots=6,7,8,9,10,5,1,2,3,4",
+                        "clientid=UWPClient_{slot}",
+                        "username=UWPClient_User_{slot}",
+                        "password=UWPClient_Pwd888881772688_{slot}",
+                        "topic.status=BT_LC/Status",
+                        "topic.control=BT_LC/Control",
+                        "topic.hwoc.status=LCHWOC/Status",
+                        "topic.hwoc.control=LCHWOC/Control",
+                        "topic.devswitches=Settings/DeviceSwitchItemStatus",
+                        "probe.key=connected",
+                        "# payload.* 留空 = 使用内置的机械革命报文模板",
+                        "payload.connected=",
+                        "payload.disconnected=",
+                        "payload.hwoc.on=",
+                        "payload.hwoc.off=",
+                    }), new UTF8Encoding(false));
+                string custom = Path.Combine(dir, "99-custom-template.ini");
+                if (!File.Exists(custom))
+                    File.WriteAllText(custom, string.Join("\r\n", new string[]
+                    {
+                        "# ===== 第三方控制台适配模板 =====",
+                        "# 用法：1) 复制本文件改个名字  2) 填下面这些字段  3) 重启程序（或选这个配置名）",
+                        "# 只要你的控制台也是「本地 MQTT broker + 水冷状态主题」这种结构，就能适配。",
+                        "# 特殊占位：{slot}=clientId 编号  {mac}=界面里的 MAC  {fw}=固件版本串  {src}=lc_sim",
+                        "",
+                        "name=第三方控制台示例",
+                        "host=127.0.0.1",
+                        "port=1883",
+                        "autoport=1",
+                        "slots=6",
+                        "clientid=client_{slot}",
+                        "username=",
+                        "password=",
+                        "topic.status=WaterCooling/Status",
+                        "topic.control=WaterCooling/Control",
+                        "topic.hwoc.status=WaterCooling/HWOC/Status",
+                        "topic.hwoc.control=WaterCooling/HWOC/Control",
+                        "topic.devswitches=",
+                        "probe.key=connected",
+                        "# 下面四条可留空（留空=用内置机械革命报文）；填了就完全按你的格式发",
+                        "payload.connected={\"src\":\"{src}\",\"connected\":true,\"ConnectString\":\"Connected\",\"DevMACString\":\"{mac}\",\"DevFWVersion\":\"{fw}\"}",
+                        "payload.disconnected={\"src\":\"{src}\",\"connected\":false,\"ConnectString\":\"Disconnected\",\"DevMACString\":\"{mac}\"}",
+                        "payload.hwoc.on={\"src\":\"{src}\",\"Enable\":true,\"Connected\":true,\"Support\":true}",
+                        "payload.hwoc.off={\"src\":\"{src}\",\"Enable\":false,\"Connected\":false,\"Support\":true}",
+                    }), new UTF8Encoding(false));
+                if (log != null) log("[配置] 控制台配置目录：" + dir + "（可放多个 .ini 适配不同控制台）");
+            }
+            catch (Exception ex) { if (log != null) log("[配置] 写示例配置失败：" + ex.Message); }
+        }
+
+        // 启动时自动挑一个能连上的配置（第三方控制台也是走这条）
+        public static Profile AutoPick(string host, int slot, Action<string> log, out int foundPort)
+        {
+            foundPort = 0;
+            List<Profile> list = LoadAll();
+            Profile best = list[0];
+            foreach (Profile p in list)
+            {
+                bool ok;
+                p.Apply();
+                int port = PortDetect.Detect(string.IsNullOrEmpty(p.Host) ? host : p.Host,
+                    p.AutoPort ? p.Port : p.Port, slot, log, out ok);
+                if (ok)
+                {
+                    foundPort = port;
+                    log("[配置] 已适配：" + p.Name + "  →  " + p.Host + ":" + port
+                        + "  主题 " + p.TopicStatus + " / " + p.TopicHwocStatus);
+                    return p;
+                }
+            }
+            best.Apply();
+            log("[配置] 没有可连上的控制台（控制中心/第三方控制台没运行？），先用内置配置：「" + best.Name + "」");
+            return best;
+        }
+    }
+
+public class FakeDock
     {
         public const string TAG = "lc_sim";
 
@@ -536,8 +752,8 @@ namespace WaterCoolSim
             MqttMini m = null;
             try
             {
-                m = new MqttMini(host, port, "UWPClient_" + slot, "UWPClient_User_" + slot,
-                    "UWPClient_Pwd888881772688_" + slot, delegate(string s) { });
+                m = new MqttMini(host, port, Profile.Cur.Cred(slot, 0), Profile.Cur.Cred(slot, 1),
+                    Profile.Cur.Cred(slot, 2), delegate(string s) { });
                 m.TimeoutMs = 500;
                 m.Connect();
                 return 2;
@@ -550,6 +766,13 @@ namespace WaterCoolSim
         // 自动识别：候选顺序 = 上次可用端口 → 厂商进程持有的监听端口 → 其它监听端口 → 默认端口
         public static int Detect(string host, int fallback, int slot, Action<string> log)
         {
+            bool ok;
+            return Detect(host, fallback, slot, log, out ok);
+        }
+
+        public static int Detect(string host, int fallback, int slot, Action<string> log, out bool ok)
+        {
+            ok = false;
             Dictionary<int, string> lis = Listeners();
             List<int> ordered = new List<int>();
             int last = Settings.Get("LastPort", 0);
@@ -575,7 +798,10 @@ namespace WaterCoolSim
             DateTime t0 = DateTime.UtcNow;
             log("[端口识别] 本机监听 " + lis.Count + " 个端口；候选 " + cand.Count + " 个"
                 + (vendor.Count > 0 ? "（厂商进程持有 " + vendor.Count + " 个）" : "（没发现厂商进程在监听）"));
-            int[] trySlots = new int[] { slot, 5 };
+            List<int> sl2 = new List<int>();
+            sl2.Add(slot);
+            foreach (int x in Profile.Cur.Slots) if (x != slot && sl2.Count < 3) sl2.Add(x);
+            int[] trySlots = sl2.ToArray();
             for (int i = 0; i < cand.Count; i++)
             {
                 if ((DateTime.UtcNow - t0).TotalMilliseconds > BudgetMs)
@@ -596,6 +822,7 @@ namespace WaterCoolSim
                     string owner = lis.ContainsKey(p) && !string.IsNullOrEmpty(lis[p]) ? "，监听进程 " + lis[p] : "";
                     log("[端口识别] 命中 " + host + ":" + p + "（clientId 编号 " + slot + owner + "）");
                     Settings.Set("LastPort", p);
+                    ok = true;
                     return p;
                 }
             }
@@ -624,7 +851,7 @@ public class SimCore
 
         public SimCore(Action<string> log) { this.log = log; }
 
-        public const string TOPIC_DEVSWS = "Settings/DeviceSwitchItemStatus";
+        public static string TOPIC_DEVSWS = "Settings/DeviceSwitchItemStatus";
 
         private static string[] SubscribeTopics()
         {
@@ -638,18 +865,30 @@ public class SimCore
 
         private static string Cred(int slot, string kind)
         {
-            if (kind == "c") return "UWPClient_" + slot;
-            if (kind == "u") return "UWPClient_User_" + slot;
-            return "UWPClient_Pwd888881772688_" + slot;
+            return Profile.Cur.Cred(slot, kind == "c" ? 0 : (kind == "u" ? 1 : 2));
+        }
+
+        // profile 里配了报文模板就用模板，否则用内置的机械革命报文
+        private string PayloadFor(string kind, string built)
+        {
+            Profile p = Profile.Cur;
+            if (p == null) return built;
+            string tpl = null;
+            if (kind == "status") tpl = p.PayloadConnected;
+            else if (kind == "hwoc") tpl = p.PayloadHwocOn;
+            else if (kind == "clean.status") tpl = p.PayloadDisconnected;
+            else if (kind == "clean.hwoc") tpl = p.PayloadHwocOff;
+            if (string.IsNullOrEmpty(tpl)) return built;
+            return p.Subst(tpl);
         }
 
         // 编号自动回退：6,7,...,20,1..4,5
         public bool ConnectAuto(int prefer)
         {
             List<int> order = new List<int>();
-            for (int n = prefer; n <= prefer + 14; n++) if (n >= 1 && n != 5) order.Add(n);
-            for (int n = 1; n <= 4; n++) order.Add(n);
-            order.Add(5);
+            order.Add(prefer);                                   // 先试首选编号
+            foreach (int n in Profile.Cur.Slots) if (n != prefer) order.Add(n);
+            for (int n = 1; n <= 20; n++) if (!order.Contains(n)) order.Add(n);
             MqttError last = null;
             for (int i = 0; i < order.Count; i++)
             {
@@ -711,8 +950,8 @@ public class SimCore
         {
             try
             {
-                Client.Publish(MqttMini.TOPIC_STATUS, Dock.BuildStatus(), true);
-                Client.Publish(MqttMini.TOPIC_HWOC_STATUS, Dock.BuildHwoc(), true);
+                Client.Publish(MqttMini.TOPIC_STATUS, PayloadFor("status", Dock.BuildStatus()), true);
+                Client.Publish(MqttMini.TOPIC_HWOC_STATUS, PayloadFor("hwoc", Dock.BuildHwoc()), true);
                 Sent += 2;
                 if (reason != null && reason.Length > 0) log("已发布状态（" + reason + "）");
             }
@@ -728,8 +967,8 @@ public class SimCore
             try
             {
                 if (Client == null || !Client.Connected) return;
-                Client.Publish(MqttMini.TOPIC_STATUS, Dock.BuildCleanupStatus(), true);
-                Client.Publish(MqttMini.TOPIC_HWOC_STATUS, Dock.BuildCleanupHwoc(), true);
+                Client.Publish(MqttMini.TOPIC_STATUS, PayloadFor("clean.status", Dock.BuildCleanupStatus()), true);
+                Client.Publish(MqttMini.TOPIC_HWOC_STATUS, PayloadFor("clean.hwoc", Dock.BuildCleanupHwoc()), true);
                 log("[自动清理] 已把 BT_LC/Status 与 LCHWOC/Status 覆盖为「未连接」，无残留");
                 Thread.Sleep(150);
             }
@@ -2784,6 +3023,9 @@ public class SimCore
                     fHost.Value.Trim(), PortOf());
                 sb.AppendLine();
                 sb.AppendLine("── 托盘 / 自启动 状态 ──");
+                sb.AppendLine("控制台配置 : " + Profile.Cur.Name + "   broker " + Profile.Cur.Host + ":" + fPort.Value.Trim()
+                    + "   主题 " + Profile.Cur.TopicStatus + " / " + Profile.Cur.TopicHwocStatus
+                    + (string.IsNullOrEmpty(Profile.Cur.PayloadConnected) ? "   报文:内置" : "   报文:自定义模板"));
                 sb.AppendLine("托盘图标   : " + (tray != null && tray.Visible ? "已在程序中启用" : (swTray.Checked ? "未创建（异常）" : "已按设置关闭")));
                 sb.AppendLine("外壳登记   : " + (tray != null && tray.Visible ? TrayShellCheck() : "(未启用托盘)"));
                 sb.AppendLine("隐藏到托盘 : " + (trayOk ? "可用" : "不可用（已被程序自动禁用，避免窗口找不回）"));
@@ -3275,10 +3517,17 @@ public class SimCore
             {
                 try
                 {
-                    // ---- 启动时自动识别水冷端口 ----
+                    // ---- 启动时自动适配控制台（含第三方）+ 自动识别端口 ----
+                    Profile.WriteSamplesIfMissing(new Action<string>(delegate(string m) { Log(m); }));
                     int sl0;
                     if (!int.TryParse(fSlot.Value.Trim(), out sl0)) sl0 = 6;
-                    int found = PortDetect.Detect(h, p, sl0, new Action<string>(delegate(string m) { Log(m); }));
+                    int found;
+                    Profile picked = Profile.AutoPick(h, sl0, new Action<string>(delegate(string m) { Log(m); }), out found);
+                    if (picked != null && found > 0)
+                    {
+                        p = found;
+                        try { BeginInvoke(new Action(delegate { fPort.Value = found.ToString(); })); } catch { }
+                    }
                     if (found != p)
                     {
                         p = found;
@@ -3338,6 +3587,8 @@ public class SimCore
             core = new SimCore(Log);
             core.Dock.Mac = fMac.Value.Trim();
             core.Dock.Fw = fFw.Value.Trim();
+            Program.CurMac = core.Dock.Mac;
+            Program.CurFw = core.Dock.Fw;
             core.Suppress = swSuppress.Checked;
             int slot;
             if (!int.TryParse(fSlot.Value.Trim(), out slot)) slot = 6;
@@ -3483,6 +3734,10 @@ public class SimCore
         public static bool NoStartupCleanup;   // --guitest 用：自检时不碰任何状态
         public static bool AutoStartLaunch;    // 由 --autostart 拉起（开机自启）
         private static string logFile;
+
+        // 供配置模板占位符 {mac} / {fw} 使用（启动模拟时同步）
+        public static string CurMac = "AA:BB:CC:00:11:22";
+        public static string CurFw = "CoolingSystem LCT21001-SIM-v1.0.0";
 
         public static void FileLog(string line)
         {
@@ -3632,6 +3887,13 @@ public class SimCore
             core.Dock.Mac = Arg(args, "--mac", core.Dock.Mac);
             core.Dock.Fw = Arg(args, "--fw", core.Dock.Fw);
 
+            // 命令行模式也先自动适配控制台（含第三方配置）
+            {
+                int fport;
+                Profile.AutoPick(core.Host, slot, new Action<string>(Out), out fport);
+                if (fport > 0) core.Port = fport;
+            }
+
             if (mode == "--cleanup")
             {
                 if (!core.ConnectAuto(slot)) return 2;
@@ -3644,6 +3906,23 @@ public class SimCore
             {
                 double secs; if (!double.TryParse(Arg(args, "--seconds", "5"), NumberStyles.Float, CultureInfo.InvariantCulture, out secs)) secs = 5;
                 return core.Probe(secs) ? 0 : 2;
+            }
+
+            if (mode == "--profiles")
+            {
+                Out("控制台配置目录：" + Profile.ProfileDir());
+                Profile.WriteSamplesIfMissing(new Action<string>(Out));
+                List<Profile> list = Profile.LoadAll();
+                foreach (Profile pf in list)
+                {
+                    pf.Apply();
+                    bool ok;
+                    int pPort = PortDetect.Detect(pf.Host, pf.Port, pf.Slots[0], new Action<string>(Out), out ok);
+                    Out((ok ? "[可连] " : "[不可连] ") + pf.Name + "   " + pf.Host + ":" + (ok ? pPort.ToString() : pf.Port.ToString())
+                        + "   主题 " + pf.TopicStatus + " / " + pf.TopicHwocStatus
+                        + (string.IsNullOrEmpty(pf.PayloadConnected) ? "   报文:内置" : "   报文:自定义模板"));
+                }
+                return 0;
             }
 
             if (mode == "--portscan")
@@ -3885,6 +4164,7 @@ public class SimCore
             Out("  WaterCoolSim.exe --palette [--seed 6750A4 | --wallpaper] [--dark]   打印 M3 色板（校验用）");
             Out("  WaterCoolSim.exe --runset on|off|status                           设置/查看开机自启动（HKCU Run）");
             Out("  WaterCoolSim.exe --portscan                                       自动识别水冷 broker 端口（诊断用）");
+            Out("  WaterCoolSim.exe --profiles                                      列出/测试控制台配置（含第三方适配）");
             Out("  WaterCoolSim.exe --shot [--out p.png]  把界面渲染成 PNG（不碰运行状态）");
             Out("可选参数：--host --port --slot --interval --mac --fw --no-suppress --no-cleanup");
             return 1;
