@@ -54,6 +54,7 @@ namespace WaterCoolSim
         private DateTime lastPing = DateTime.UtcNow;
 
         public volatile bool Connected;
+        public int TimeoutMs = 5000;      // 连接/等 CONNACK 的超时（端口扫描时会调小）
         public event Action<string, string, bool> OnMessage;   // topic, payload, retain
         public event Action OnReconnected;
 
@@ -108,7 +109,13 @@ namespace WaterCoolSim
         {
             Close();
             Socket s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            s.Connect(host, port);
+            IAsyncResult ar = s.BeginConnect(host, port, null, null);
+            if (!ar.AsyncWaitHandle.WaitOne(TimeoutMs))
+            {
+                try { s.Close(); } catch { }
+                throw new IOException("连接 " + host + ":" + port + " 超时");
+            }
+            s.EndConnect(ar);
             s.NoDelay = true;
             sock = s;
 
@@ -122,7 +129,7 @@ namespace WaterCoolSim
             SendRaw(Cat(new byte[] { 0x10 }, EncLen(body.Length), body));
 
             byte cmd, fl; byte[] resp;
-            if (!ReadPacket(5000, out cmd, out fl, out resp)) throw new IOException("CONNACK 超时");
+            if (!ReadPacket(TimeoutMs, out cmd, out fl, out resp)) throw new IOException("CONNACK 超时");
             if (cmd != 2) throw new IOException("未收到 CONNACK（cmd=" + cmd + "）");
             byte code = resp.Length >= 2 ? resp[1] : (byte)255;
             if (code != 0) throw new MqttError(code, ConnackText(code));
@@ -486,7 +493,118 @@ namespace WaterCoolSim
     // ============================================================
     //  模拟器核心（GUI 与命令行共用）
     // ============================================================
-    public class SimCore
+        // ============================================================
+    //  启动时自动识别水冷端口：枚举本机监听端口 + MQTT 实连验证
+    // ============================================================
+    public static class PortDetect
+    {
+        [System.Runtime.InteropServices.DllImport("iphlpapi.dll")]
+        private static extern int GetExtendedTcpTable(IntPtr pTcpTable, ref int pdwSize, bool bOrder, int ulAf, int tableClass, int reserved);
+
+        // 端口 -> 持有该监听端口的进程名
+        public static Dictionary<int, string> Listeners()
+        {
+            Dictionary<int, string> res = new Dictionary<int, string>();
+            int size = 0;
+            GetExtendedTcpTable(IntPtr.Zero, ref size, false, 2, 3, 0);   // AF_INET, TCP_TABLE_OWNER_PID_LISTENER
+            if (size <= 4) return res;
+            IntPtr buf = System.Runtime.InteropServices.Marshal.AllocHGlobal(size);
+            try
+            {
+                if (GetExtendedTcpTable(buf, ref size, false, 2, 3, 0) != 0) return res;
+                int n = System.Runtime.InteropServices.Marshal.ReadInt32(buf);
+                long baseAddr = (long)buf + 4;
+                for (int i = 0; i < n; i++)
+                {
+                    IntPtr cur = (IntPtr)(baseAddr + i * 24L);      // MIB_TCPROW_OWNER_PID = 24 字节
+                    int rawPort = System.Runtime.InteropServices.Marshal.ReadInt32(cur, 8);
+                    int port = ((rawPort & 0xFF) << 8) | ((rawPort >> 8) & 0xFF);
+                    int pid = System.Runtime.InteropServices.Marshal.ReadInt32(cur, 20);
+                    if (port <= 0 || res.ContainsKey(port)) continue;
+                    string name = "";
+                    try { name = System.Diagnostics.Process.GetProcessById(pid).ProcessName; } catch { }
+                    res[port] = name;
+                }
+            }
+            finally { System.Runtime.InteropServices.Marshal.FreeHGlobal(buf); }
+            return res;
+        }
+
+        // 0=连不上/不是 MQTT   1=是 MQTT broker 但认证被拒   2=连接成功
+        private static int TryOne(string host, int port, int slot)
+        {
+            MqttMini m = null;
+            try
+            {
+                m = new MqttMini(host, port, "UWPClient_" + slot, "UWPClient_User_" + slot,
+                    "UWPClient_Pwd888881772688_" + slot, delegate(string s) { });
+                m.TimeoutMs = 500;
+                m.Connect();
+                return 2;
+            }
+            catch (MqttError) { return 1; }
+            catch { return 0; }
+            finally { if (m != null) { try { m.Close(); } catch { } } }
+        }
+
+        // 自动识别：候选顺序 = 上次可用端口 → 厂商进程持有的监听端口 → 其它监听端口 → 默认端口
+        public static int Detect(string host, int fallback, int slot, Action<string> log)
+        {
+            Dictionary<int, string> lis = Listeners();
+            List<int> ordered = new List<int>();
+            int last = Settings.Get("LastPort", 0);
+            if (last > 0) ordered.Add(last);
+            List<int> vendor = new List<int>();
+            List<int> others = new List<int>();
+            foreach (KeyValuePair<int, string> kv in lis)
+            {
+                string nm = (kv.Value ?? "").ToLowerInvariant();
+                if (nm.Contains("gcu") || nm.Contains("controlcenter") || nm.Contains("ccu")
+                    || nm.Contains("aistone") || nm.Contains("liquid")) vendor.Add(kv.Key);
+                else others.Add(kv.Key);
+            }
+            vendor.Sort(); others.Sort();
+            ordered.AddRange(vendor);
+            ordered.AddRange(others);
+            if (fallback > 0) ordered.Add(fallback);
+            HashSet<int> seen = new HashSet<int>();
+            List<int> cand = new List<int>();
+            foreach (int p in ordered) if (p > 0 && p < 65536 && seen.Add(p)) cand.Add(p);
+            if (cand.Count > 40) cand = cand.GetRange(0, 40);
+            const int BudgetMs = 12000;                 // 总时间预算：超了就停（后台线程，但别拖太久）
+            DateTime t0 = DateTime.UtcNow;
+            log("[端口识别] 本机监听 " + lis.Count + " 个端口；候选 " + cand.Count + " 个"
+                + (vendor.Count > 0 ? "（厂商进程持有 " + vendor.Count + " 个）" : "（没发现厂商进程在监听）"));
+            int[] trySlots = new int[] { slot, 5 };
+            for (int i = 0; i < cand.Count; i++)
+            {
+                if ((DateTime.UtcNow - t0).TotalMilliseconds > BudgetMs)
+                {
+                    log("[端口识别] 已尝试 " + i + " 个端口仍未命中，超过 " + (BudgetMs / 1000) + " 秒预算，停止扫描");
+                    break;
+                }
+                int p = cand[i];
+                int r = 0;
+                for (int s = 0; s < trySlots.Length && r != 2; s++)
+                {
+                    int rr = TryOne(host, p, trySlots[s]);
+                    if (rr == 2) { r = 2; slot = trySlots[s]; break; }
+                    if (rr == 1) r = 1;
+                }
+                if (r == 2)
+                {
+                    string owner = lis.ContainsKey(p) && !string.IsNullOrEmpty(lis[p]) ? "，监听进程 " + lis[p] : "";
+                    log("[端口识别] 命中 " + host + ":" + p + "（clientId 编号 " + slot + owner + "）");
+                    Settings.Set("LastPort", p);
+                    return p;
+                }
+            }
+            log("[端口识别] 没找到可用的水冷 broker（控制中心没运行？）——先用默认端口 " + fallback);
+            return fallback;
+        }
+    }
+
+public class SimCore
     {
         private Action<string> log;
         public MqttMini Client;
@@ -3157,6 +3275,17 @@ namespace WaterCoolSim
             {
                 try
                 {
+                    // ---- 启动时自动识别水冷端口 ----
+                    int sl0;
+                    if (!int.TryParse(fSlot.Value.Trim(), out sl0)) sl0 = 6;
+                    int found = PortDetect.Detect(h, p, sl0, new Action<string>(delegate(string m) { Log(m); }));
+                    if (found != p)
+                    {
+                        p = found;
+                        try { BeginInvoke(new Action(delegate { fPort.Value = found.ToString(); })); } catch { }
+                    }
+                    else Log("[端口识别] 使用端口 " + p);
+
                     EnvReport rep = SelfCheck.RunEnv(new Action<string>(delegate(string m) { Log(m); }), h, p);
                     bool probeOk = false;
                     try
@@ -3274,8 +3403,9 @@ namespace WaterCoolSim
                 {
                     SimCore c2 = new SimCore(new Action<string>(delegate(string m) { Log(m); }));
                     c2.Slot = 8;
-                    c2.Host = "127.0.0.1";
-                    c2.Port = 13688;
+                    c2.Host = fHost.Value.Trim();
+                    int lp = Settings.Get("LastPort", PortOf());
+                    c2.Port = lp > 0 ? lp : PortOf();
                     if (c2.ConnectAuto(8))
                     {
                         c2.CleanupStale();
@@ -3516,6 +3646,19 @@ namespace WaterCoolSim
                 return core.Probe(secs) ? 0 : 2;
             }
 
+            if (mode == "--portscan")
+            {
+                Out("自动识别水冷 broker 端口（枚举本机监听端口并逐个做 MQTT 实连验证）…");
+                Out("监听到的端口/进程：");
+                Dictionary<int, string> lis = PortDetect.Listeners();
+                List<int> ks = new List<int>(lis.Keys);
+                ks.Sort();
+                foreach (int k in ks) Out("  " + k + "  " + (string.IsNullOrEmpty(lis[k]) ? "(未知进程)" : lis[k]));
+                int found = PortDetect.Detect("127.0.0.1", 13688, 6, new Action<string>(Out));
+                Out("识别结果: " + found);
+                return 0;
+            }
+
             if (mode == "--runset")
             {
                 string what = Arg(args, "--set", args.Length > 1 ? args[1] : "status");
@@ -3741,6 +3884,7 @@ namespace WaterCoolSim
             Out("  WaterCoolSim.exe --selfcheck           环境自检 + 只读探测 broker");
             Out("  WaterCoolSim.exe --palette [--seed 6750A4 | --wallpaper] [--dark]   打印 M3 色板（校验用）");
             Out("  WaterCoolSim.exe --runset on|off|status                           设置/查看开机自启动（HKCU Run）");
+            Out("  WaterCoolSim.exe --portscan                                       自动识别水冷 broker 端口（诊断用）");
             Out("  WaterCoolSim.exe --shot [--out p.png]  把界面渲染成 PNG（不碰运行状态）");
             Out("可选参数：--host --port --slot --interval --mac --fw --no-suppress --no-cleanup");
             return 1;
