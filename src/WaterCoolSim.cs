@@ -3031,7 +3031,7 @@ public class SimCore
             swAuto = MkSwitch(Settings.AutoStartEnabled(), cardSet);
             lblSw2 = MkLabel("开机自启动", 9F, FontStyle.Regular, P.OnSurfaceVariant, true);
             cardSet.Controls.Add(lblSw2);
-            swAutoSim = MkSwitch(Settings.GetBool("AutoSim", true), cardSet);
+            swAutoSim = MkSwitch(Settings.GetBool("AutoSim", false), cardSet);
             lblSw3 = MkLabel("自启动时同时开始模拟", 9F, FontStyle.Regular, P.OnSurfaceVariant, true);
             cardSet.Controls.Add(lblSw3);
             swCleanStart = MkSwitch(Settings.GetBool("CleanStart", true), cardSet);
@@ -3064,7 +3064,7 @@ public class SimCore
             lblRevo = MkLabel("第三方控制台（OpenRevo）", 11F, FontStyle.Bold, P.OnSurface, true);
             cardRevo.Controls.Add(lblRevo);
             swRevo = MkSwitch(Settings.GetBool("RevoSim", true), cardRevo);
-            lblRevoSub = MkLabel("模拟「水冷外置魔盒已连接」（只改它的运行内存，不动文件；退出即还原）", 9F, FontStyle.Regular, P.OnSurfaceVariant, true);
+            lblRevoSub = MkLabel("点「启动模拟」时一并模拟它（仅改它的运行内存，停止/退出即还原）", 9F, FontStyle.Regular, P.OnSurfaceVariant, true);
             cardRevo.Controls.Add(lblRevoSub);
             btnRevoRetry = MkButton("重新挂钩", Md3Kind.Outlined, 9F, FontStyle.Regular);
             btnRevoRetry.Click += delegate { TryRevoAttach(); };
@@ -3072,9 +3072,10 @@ public class SimCore
             swRevo.CheckedChanged += delegate
             {
                 Settings.SetBool("RevoSim", swRevo.Checked);
-                Log("[OpenRevo] 模拟已连接：" + (swRevo.Checked ? "开" : "关"));
-                if (swRevo.Checked) TryRevoAttach();
-                else { OpenRevoSim.Detach(); RefreshRevoLabel(); }
+                Log("[OpenRevo] 随「启动模拟」一起模拟：" + (swRevo.Checked ? "开" : "关"));
+                // 只在「已经开始模拟」的状态下跟着变；没启动就不动作（默认不模拟）
+                if (started && swRevo.Checked) TryRevoAttach();
+                else if (!swRevo.Checked) { OpenRevoSim.Detach(); RefreshRevoLabel(); }
             };
             revoTimer = new System.Windows.Forms.Timer();
             revoTimer.Interval = 2000;
@@ -3844,8 +3845,18 @@ public class SimCore
 
             btnStart.Enabled = false;
             SetState("连接中…", LedState.Idle);
+            bool revoHooked = false;
+            if (swRevo.Checked) { TryRevoAttach(); revoHooked = OpenRevoSim.Attached; }
             if (!core.Start())
             {
+                if (revoHooked)
+                {
+                    started = true;
+                    btnStop.Enabled = true;
+                    SetState("运行中 · OpenRevo", LedState.Running);
+                    Log("官方 broker 连不上（OpenRevo 不用 broker），但 OpenRevo 已在内存挂钩模拟：它那边现在就显示「水冷已连接」");
+                    return;
+                }
                 SetState("连接失败", LedState.Error);
                 Log("启动失败：没找到可用连接——控制中心（GCUBridge）没在运行，或鉴权编号都不通。");
                 Log("       排查：① 控制中心是否开着（或服务 GCUBridge 是否已启动）；② 「本机信息」页看「控制台配置」与自动检测结果；③ 命令行 --profiles / --portscan");
@@ -3869,6 +3880,8 @@ public class SimCore
         private void OnStop(object sender, EventArgs e)
         {
             timer.Stop();
+            if (OpenRevoSim.Attached) { OpenRevoSim.Detach(); Log("[OpenRevo] 已停止模拟并还原它的内存"); }
+            RefreshRevoLabel();
             if (core != null) core.Stop(true);
             started = false;
             btnStart.Enabled = true;
@@ -3935,7 +3948,9 @@ public class SimCore
         private void RevoTick()
         {
             if (swRevo == null) return;
-            if (swRevo.Checked && !OpenRevoSim.Attached) TryRevoAttach();
+            bool want = started && swRevo.Checked;     // 没点「启动模拟」就不模拟
+            if (want && !OpenRevoSim.Attached) TryRevoAttach();
+            else if (!want && OpenRevoSim.Attached) { OpenRevoSim.Detach(); RefreshRevoLabel(); }
             else RefreshRevoLabel();
         }
 
